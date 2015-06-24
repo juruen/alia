@@ -440,6 +440,63 @@ Values for consistency:
   ([^Session session query]
      (execute-chan-buffered session query {})))
 
+(declare fetch-remaining)
+
+(defn- process-result
+  "Process only already fetched rows"
+  [^ResultSet result ch string-keys? statement values executor]
+  (let [rows (codec/result-set-fetched->maps result string-keys?)]
+    (async/put! ch rows)
+    (if (.isExhausted result)
+      (async/close! ch)
+      (fetch-remaining result ch string-keys? statement values executor))))
+
+(defn- fetch-remaining
+  "Add callback to fetch remaining rows"
+  [^ResultSet result ch string-keys? statement values executor]
+  (Futures/addCallback
+   (.fetchMoreResults result)
+   (reify FutureCallback
+     (onSuccess [_ r]
+        (process-result result ch string-keys? statement values executor))
+     (onFailure [_ ex]
+       (async/put! ch (ex->ex-info ex {:query statement :values values}))
+       (async/close! ch)))
+   executor))
+
+(defn execute-async-chan-buffered
+  "Same as execute-chan-buffered but fully asynchronous."
+  ([^Session session query {:keys [executor consistency serial-consistency
+                                   routing-key retry-policy tracing? idempotent?
+                                   string-keys? fetch-size values timestamp
+                                   channel paging-state]}]
+     (let [^Statement statement (query->statement query values)]
+       (set-statement-options! statement routing-key retry-policy
+                               tracing? idempotent?
+                               consistency serial-consistency fetch-size
+                               timestamp paging-state)
+       (let [^ResultSetFuture rs-future (.executeAsync session statement)
+             ch (or channel (async/chan (or fetch-size (-> session
+                                                           .getCluster
+                                                           .getConfiguration
+                                                           .getQueryOptions
+                                                           .getFetchSize))))]
+         (Futures/addCallback
+          rs-future
+          (reify FutureCallback
+            (onSuccess [_ result]
+              (async/go
+               ; Process the first page of rows
+               (process-result
+                result ch string-keys? statement values (get-executor executor))))
+            (onFailure [_ ex]
+              (async/put! ch (ex->ex-info ex {:query statement :values values}))
+              (async/close! ch)))
+          (get-executor executor))
+         ch)))
+  ([^Session session query]
+     (execute-async-chan-buffered session query {})))
+
 (defn ^:no-doc lazy-query-
   [session query pred coll opts]
   (lazy-cat coll

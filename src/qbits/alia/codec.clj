@@ -116,19 +116,28 @@
   (decode [x] x)
   (encode [x] x))
 
+(defn- row->map
+  [string-keys?]
+  (let [key-fn (if string-keys? identity keyword)]
+    (fn [^Row row]
+      (let [cdef (.getColumnDefinitions row) len (.size cdef)]
+        (loop [idx (int 0)
+               row-map (transient {})]
+          (if (= idx len)
+            (persistent! row-map)
+            (recur (unchecked-inc-int idx)
+                   (assoc! row-map
+                           (key-fn (.getName cdef idx))
+                           (deserialize row idx (.getType cdef idx))))))))))
+
 (defn result-set->maps
   [^ResultSet result-set string-keys?]
-  (let [key-fn (if string-keys? identity keyword)]
-    (-> (map (fn [^Row row]
-               (let [cdef (.getColumnDefinitions row)
-                     len (.size cdef)]
-                 (loop [idx (int 0)
-                        row-map (transient {})]
-                   (if (= idx len)
-                     (persistent! row-map)
-                     (recur (unchecked-inc-int idx)
-                            (assoc! row-map
-                                    (key-fn (.getName cdef idx))
-                                    (deserialize row idx (.getType cdef idx))))))))
-             result-set)
+    (-> (map (row->map string-keys?) result-set)
+        (vary-meta assoc :execution-info (.getExecutionInfo result-set))))
+
+(defn result-set-fetched->maps
+  [^ResultSet result-set string-keys?]
+  (let [fetched (.getAvailableWithoutFetching result-set)
+        rows (doall (repeatedly fetched #(.one result-set)))]
+    (-> (map (row->map string-keys?) (filter (comp not nil?) rows))
         (vary-meta assoc :execution-info (.getExecutionInfo result-set)))))
